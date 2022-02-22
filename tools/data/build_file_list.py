@@ -112,6 +112,7 @@ def build_file_list(splits, frame_info, shuffle=False):
         """
         rgb_list, flow_list = list(), list()
         for item in split:
+
             if item[0] not in frame_info:
                 continue
             if frame_info[item[0]][1] > 0:

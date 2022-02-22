@@ -79,7 +79,6 @@ def main():
     args = parse_args()
 
     cfg = Config.fromfile(args.config)
-
     cfg.merge_from_dict(args.cfg_options)
 
     # set cudnn_benchmark
