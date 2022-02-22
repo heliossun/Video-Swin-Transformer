@@ -461,6 +461,27 @@ class PatchEmbed3D(nn.Module):
 
         return x
 
+class PatchUnEmbed3D(nn.Module):
+    """ Video to Patch UnEmbedding.
+
+    Args:
+        patch_size (int): Patch token size. Default: (2,4,4).
+        in_chans (int): Number of input video channels. Default: 3.
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        norm_layer (nn.Module, optional): Normalization layer. Default: None
+    """
+
+    def __init__(self, patch_size=(2, 4, 4), in_chans=3, embed_dim=96, norm_layer=None):
+        super().__init__()
+        self.embed_dim = embed_dim
+
+    def forward(self, x, x_size):
+        """Forward function."""
+        # padding
+        B, D, HW, C = x.size()  # B C D H W
+        x = x.transpose(1, 2).view(B, D, self.embed_dim, D, x_size[0],x_size[1])  # B,D,C,ph, pw
+
+        return x
 class RSTB(nn.Module):
     """Residual Swin Transformer Block (RSTB).
 
@@ -508,21 +529,19 @@ class RSTB(nn.Module):
                                          use_checkpoint=use_checkpoint)
 
         if resi_connection == '1conv':
-            self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
+            self.conv = nn.Conv3d(dim, dim, 3, 1, 1)
         elif resi_connection == '3conv':
             # to save parameters and memory
-            self.conv = nn.Sequential(nn.Conv2d(dim, dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                                      nn.Conv2d(dim // 4, dim // 4, 1, 1, 0),
+            self.conv = nn.Sequential(nn.Conv3d(dim, dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                      nn.Conv3d(dim // 4, dim // 4, 1, 1, 0),
                                       nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                                      nn.Conv2d(dim // 4, dim, 3, 1, 1))
+                                      nn.Conv3d(dim // 4, dim, 3, 1, 1))
 
-        self.patch_embed = PatchEmbed(
-            img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim,
-            norm_layer=None)
+        self.patch_embed = PatchEmbed3D(
+            patch_size=patch_size, in_chans=dim, embed_dim=dim, norm_layer=None)
 
-        self.patch_unembed = PatchUnEmbed(
-            img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim,
-            norm_layer=None)
+        self.patch_unembed = PatchUnEmbed3D(
+            patch_size=patch_size, in_chans=dim, embed_dim=dim, norm_layer=None)
 
     def forward(self, x, x_size):
         # print('>>>>>>RSTB input shape=', x.shape) # [4,65536,64]
@@ -540,10 +559,9 @@ class RSTB(nn.Module):
         return flops
 
 @BACKBONES.register_module()
-class SwinTransformer3D(nn.Module):
-    """ Swin Transformer backbone.
-        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
-          https://arxiv.org/pdf/2103.14030
+class SwinIR3D(nn.Module):
+    """ SwinIR Transformer backbone.
+
 
     Args:
         patch_size (int | tuple(int)): Patch size. Default: (4,4,4).
@@ -582,9 +600,12 @@ class SwinTransformer3D(nn.Module):
                  norm_layer=nn.LayerNorm,
                  patch_norm=False,
                  frozen_stages=-1,
-                 use_checkpoint=False):
+                 use_checkpoint=False,
+                 img_range=1.,
+                 resi_connection='1conv'):
         super().__init__()
-
+        num_out_ch = in_chans
+        num_feat = 64
         self.pretrained = pretrained
         self.pretrained2d = pretrained2d
         self.num_layers = len(depths)
@@ -593,21 +614,37 @@ class SwinTransformer3D(nn.Module):
         self.frozen_stages = frozen_stages
         self.window_size = window_size
         self.patch_size = patch_size
+        self.img_range = img_range
+        if in_chans == 3:
+            rgb_mean = (0.4488, 0.4371, 0.4040)
+            self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
+        else:
+            self.mean = torch.zeros(1, 1, 1, 1)
+        #####################################################################################################
+        ################################### 1, shallow feature extraction ###################################
+        self.conv_first = nn.Conv3d(in_chans, embed_dim, 3, 1, 1)
 
+        #####################################################################################################
+        ################################### 2, deep feature extraction ######################################
+        self.ape = ape
+        self.num_features = embed_dim
+        self.mlp_ratio = mlp_ratio
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed3D(
             patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
             norm_layer=norm_layer if self.patch_norm else None)
 
         self.pos_drop = nn.Dropout(p=drop_rate)
-
+        self.patch_unembed = PatchUnEmbed3D(
+            patch_size=patch_size, in_chans=embed_dim, embed_dim=embed_dim,
+            norm_layer=norm_layer if self.patch_norm else None)
         # stochastic depth
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
 
         # build layers
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            layer = BasicLayer(
+            layer = RSTB(
                 dim=int(embed_dim * 2 ** i_layer),
                 depth=depths[i_layer],
                 num_heads=num_heads[i_layer],
@@ -619,14 +656,32 @@ class SwinTransformer3D(nn.Module):
                 attn_drop=attn_drop_rate,
                 drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                 norm_layer=norm_layer,
-                downsample=PatchMerging if i_layer < self.num_layers - 1 else None,
-                use_checkpoint=use_checkpoint)
+                downsample=None,
+                use_checkpoint=use_checkpoint,
+                resi_connection=resi_connection)
             self.layers.append(layer)
 
         self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
 
         # add a norm layer for each output
         self.norm = norm_layer(self.num_features)
+        # build the last conv layer in deep feature extraction
+        if resi_connection == '1conv':
+            self.conv_after_body = nn.Conv3d(embed_dim, embed_dim, 3, 1, 1)
+        elif resi_connection == '3conv':
+            # to save parameters and memory
+            self.conv_after_body = nn.Sequential(nn.Conv3d(embed_dim, embed_dim // 4, 3, 1, 1),
+                                                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                                 nn.Conv3d(embed_dim // 4, embed_dim // 4, 1, 1, 0),
+                                                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                                 nn.Conv3d(embed_dim // 4, embed_dim, 3, 1, 1))
+
+        #####################################################################################################
+        ################################ 3, high quality image reconstruction ################################
+        # for classical SR
+        self.conv_before_upsample = nn.Sequential(nn.Conv3d(embed_dim, num_feat, 3, 1, 1),
+                                                  nn.LeakyReLU(inplace=True))
+        self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
 
         self._freeze_stages()
 
@@ -669,11 +724,7 @@ class SwinTransformer3D(nn.Module):
         for k in attn_mask_keys:
             del state_dict[k]
 
-        state_dict['patch_embed.proj.weight'] = state_dict['patch_embed.proj.weight'].unsqueeze(2).repeat(1, 1,
-                                                                                                          self.patch_size[
-                                                                                                              0], 1,
-                                                                                                          1) / \
-                                                self.patch_size[0]
+        state_dict['patch_embed.proj.weight'] = state_dict['patch_embed.proj.weight'].unsqueeze(2).repeat(1,1,self.patch_size[0],1,1) / self.patch_size[0]
 
         # bicubic interpolate relative_position_bias_table if not match
         relative_position_bias_table_keys = [k for k in state_dict.keys() if "relative_position_bias_table" in k]
@@ -739,23 +790,53 @@ class SwinTransformer3D(nn.Module):
         else:
             raise TypeError('pretrained must be a str or None')
 
-    def forward(self, x):
-        """Forward function."""
-        x = self.patch_embed(x)
+    def check_image_size(self, x):
+        _, _, h, w = x.size()
+        mod_pad_h = (self.window_size - h % self.window_size) % self.window_size
+        mod_pad_w = (self.window_size - w % self.window_size) % self.window_size
+        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
+        return x
 
+    def forward_features(self, x):
+        x_size = (x.shape[2], x.shape[3])
+        x = self.patch_embed(x)
+        #if self.ape:
+            #x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
 
         for layer in self.layers:
-            x = layer(x.contiguous())
+            x = layer(x, x_size)
 
-        x = rearrange(x, 'n c d h w -> n d h w c')
+        #x = rearrange(x, 'n c d h w -> n d h w c')
         x = self.norm(x)
-        x = rearrange(x, 'n d h w c -> n c d h w')
+        #x = rearrange(x, 'n d h w c -> n c d h w')
+        x = self.patch_unembed(x, x_size)
+
+        return x
+
+    def forward(self, x):
+        """Forward function."""
+        print(f'input shape is : {x.size()}')
+        x = self.check_image_size(x)
+        print(f'input shape after padding is : {x.size()}')
+        self.mean = self.mean.type_as(x)
+        x = (x - self.mean) * self.img_range
+
+        x = self.conv_first(x)
+        print(f'feature shape after first  conv is : {x.size()}')
+        x = self.conv_after_body(self.forward_features(x)) + x
+        print(f'feature shape after rstb : {x.size()}')
+        x = self.conv_before_upsample(x)
+        print(f'feature shape after last second conv : {x.size()}')
+        x = self.conv_last(x)
+        print(f'output shape : {x.size()}')
+
+        x = x / self.img_range + self.mean
 
         return x
 
     def train(self, mode=True):
         """Convert the model into training mode while keep layers freezed."""
-        super(SwinTransformer3D, self).train(mode)
+        super(SwinIR3D, self).train(mode)
         self._freeze_stages()
 
