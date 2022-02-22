@@ -20,7 +20,7 @@ class VideoSCIDataset(Dataset):
         **kwargs: Keyword arguments for ``BaseDataset``.
     """
 
-    def __init__(self, VideoSCIDataset, test_mode=False):
+    def __init__(self, path, test_mode=False):
         super().__init__()
         self.path = path
         self.test_mode = test_mode
